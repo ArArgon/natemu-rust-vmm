@@ -148,6 +148,60 @@ where
     }
 }
 
+impl<M> DescriptorChain<M>
+where
+    M: Deref,
+    M::Target: GuestMemory,
+{
+    // Shared traversal: the legacy iterator discards errors, while the checked wrapper
+    // distinguishes exhaustion from a descriptor that explicitly ended the chain.
+    fn next_descriptor(
+        &mut self,
+        allow_indirect: bool,
+        checked: bool,
+    ) -> Result<Descriptor, Error> {
+        loop {
+            if self.next_index >= self.queue_size {
+                return Err(Error::InvalidDescriptorIndex);
+            }
+            if self.ttl == 0 {
+                return Err(Error::InvalidChain);
+            }
+            let desc_addr = self
+                .desc_table
+                .checked_add(u64::from(self.next_index) * size_of::<Descriptor>() as u64)
+                .ok_or(Error::AddressOverflow)?;
+            let desc = self
+                .mem
+                .read_obj::<Descriptor>(desc_addr)
+                .map_err(Error::GuestMemory)?;
+
+            if desc.refers_to_indirect_table() {
+                if !allow_indirect || (checked && desc.has_next()) {
+                    return Err(Error::InvalidIndirectDescriptor);
+                }
+                if checked && desc.len() == 0 {
+                    return Err(Error::InvalidIndirectDescriptorTable);
+                }
+                self.switch_to_indirect_table(desc)?;
+                continue;
+            }
+
+            self.yielded_bytes = self
+                .yielded_bytes
+                .checked_add(desc.len())
+                .ok_or(Error::DescriptorChainOverflow)?;
+            if desc.has_next() {
+                self.next_index = desc.next();
+                self.ttl -= 1;
+            } else {
+                self.ttl = 0;
+            }
+            return Ok(desc);
+        }
+    }
+}
+
 impl<M> Iterator for DescriptorChain<M>
 where
     M: Deref,
@@ -155,48 +209,112 @@ where
 {
     type Item = Descriptor;
 
-    /// Return the next descriptor in this descriptor chain, if there is one.
+    /// Return the next descriptor, treating a malformed chain as exhausted.
     ///
-    /// Note that this is distinct from the next descriptor chain returned by
-    /// [`AvailIter`](struct.AvailIter.html), which is the head of the next
-    /// _available_ descriptor chain.
+    /// Use [`CheckedDescriptorChain`] when errors must be distinguished from a
+    /// descriptor without a NEXT flag.
     fn next(&mut self) -> Option<Self::Item> {
-        if self.ttl == 0 || self.next_index >= self.queue_size {
+        self.next_descriptor(true, false).ok()
+    }
+}
+
+/// Fallible traversal of a split descriptor chain from a caller-supplied head.
+///
+/// Each item is a descriptor or an error. After an error or a descriptor without
+/// NEXT, the iterator is exhausted. A valid prefix does not validate the whole
+/// chain: consume it completely and check every result before performing effects.
+///
+/// This validates traversal, not buffer direction, payload ranges, device-specific
+/// limits or ownership. Descriptors are read lazily; callers needing a stable
+/// request must supply a memory snapshot or exclude concurrent descriptor mutation.
+#[derive(Clone, Debug)]
+pub struct CheckedDescriptorChain<M> {
+    chain: DescriptorChain<M>,
+    allow_indirect: bool,
+    remaining: u16,
+    finished: bool,
+}
+
+impl<M> CheckedDescriptorChain<M>
+where
+    M: Deref,
+    M::Target: GuestMemory,
+{
+    /// Construct a checked chain from a descriptor-table address and head index.
+    ///
+    /// `queue_size` must be a nonzero power of two, the direct table must be
+    /// 16-byte aligned, its address range must not overflow, and the head must
+    /// be in range. Table readability is checked during iteration.
+    ///
+    /// Set `allow_indirect` only when indirect descriptors were negotiated. When
+    /// false, an indirect descriptor is rejected before its table is accessed.
+    /// Checked traversal also rejects nested, empty, malformed-length and
+    /// NEXT-bearing indirect descriptors, and chains exceeding the queue size.
+    pub fn new(
+        mem: M,
+        desc_table: GuestAddress,
+        queue_size: u16,
+        head_index: u16,
+        allow_indirect: bool,
+    ) -> Result<Self, Error> {
+        if !queue_size.is_power_of_two() {
+            return Err(Error::InvalidSize);
+        }
+        if desc_table.raw_value() & u64::from(VRING_DESC_ALIGN_SIZE - 1) != 0 {
+            return Err(Error::InvalidDescTableAlign);
+        }
+        if head_index >= queue_size {
+            return Err(Error::InvalidDescriptorIndex);
+        }
+        desc_table
+            .checked_add(u64::from(queue_size) * size_of::<Descriptor>() as u64 - 1)
+            .ok_or(Error::AddressOverflow)?;
+        Ok(Self {
+            chain: DescriptorChain::new(mem, desc_table, queue_size, head_index),
+            allow_indirect,
+            remaining: queue_size,
+            finished: false,
+        })
+    }
+
+    /// Return the index of the original direct-table head.
+    pub fn head_index(&self) -> u16 {
+        self.chain.head_index()
+    }
+}
+
+impl<M> Iterator for CheckedDescriptorChain<M>
+where
+    M: Deref,
+    M::Target: GuestMemory,
+{
+    type Item = Result<Descriptor, Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
             return None;
         }
-
-        let desc_addr = self
-            .desc_table
-            // The multiplication can not overflow an u64 since we are multiplying an u16 with a
-            // small number.
-            .checked_add(self.next_index as u64 * size_of::<Descriptor>() as u64)?;
-
-        // The guest device driver should not touch the descriptor once submitted, so it's safe
-        // to use read_obj() here.
-        let desc = self.mem.read_obj::<Descriptor>(desc_addr).ok()?;
-
-        if desc.refers_to_indirect_table() {
-            self.switch_to_indirect_table(desc).ok()?;
-            return self.next();
-        }
-
-        // constructing a chain that is longer than 2^32 bytes is illegal,
-        // let's terminate the iteration if something violated this.
-        // (VIRTIO v1.2, 2.7.5.2: "Drivers MUST NOT add a descriptor chain
-        // longer than 2^32 bytes in total;")
-        self.yielded_bytes = self.yielded_bytes.checked_add(desc.len())?;
-
-        if desc.has_next() {
-            self.next_index = desc.next();
-            // It's ok to decrement `self.ttl` here because we check at the start of the method
-            // that it's greater than 0.
-            self.ttl -= 1;
+        let result = if self.remaining == 0 {
+            Err(Error::InvalidChain)
         } else {
-            self.ttl = 0;
+            self.chain.next_descriptor(self.allow_indirect, true)
+        };
+        match &result {
+            Ok(desc) => {
+                self.remaining -= 1;
+                self.finished = !desc.has_next();
+            }
+            Err(_) => self.finished = true,
         }
-
-        Some(desc)
+        Some(result)
     }
+}
+
+impl<M> std::iter::FusedIterator for CheckedDescriptorChain<M>
+where
+    M: Deref,
+    M::Target: GuestMemory,
+{
 }
 
 /// An iterator for readable or writable descriptors.

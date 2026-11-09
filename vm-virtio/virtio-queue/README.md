@@ -220,3 +220,20 @@ This project is licensed under either of
 
 - [Apache License](http://www.apache.org/licenses/LICENSE-2.0), Version 2.0
 - [BSD-3-Clause License](https://opensource.org/licenses/BSD-3-Clause)
+
+### Checked traversal from a captured head
+
+`CheckedDescriptorChain::new(memory, table_address, queue_size, head_index,
+allow_indirect)` exposes fallible traversal without requiring an available-ring
+read. Pass `false` unless indirect descriptors were negotiated. Unlike the
+legacy `DescriptorChain` iterator, malformed next indices, exhausted chain
+budgets, inaccessible descriptors and overflows produce an error rather than
+appearing to be a clean end. The checked iterator stops permanently after an
+error. It also rejects empty/nested indirect tables and INDIRECT together with NEXT;
+the legacy iterator retains its existing behavior.
+
+Consume and validate the entire result before performing device effects. The
+iterator reads descriptors lazily and does not validate payload accessibility,
+direction, device-specific limits or ownership. For asynchronous processing,
+provide stable captured metadata (or exclude descriptor mutation during traversal),
+then retain owned request data rather than a live iterator into guest memory.
